@@ -29,6 +29,7 @@ pub use reth_trie_parallel::{
     },
 };
 use std::{
+    collections::BTreeMap,
     ops::Not,
     sync::{
         atomic::{AtomicBool, AtomicUsize},
@@ -195,26 +196,15 @@ where
     /// blocks.
     const SMALL_BLOCK_TX_THRESHOLD: usize = 30;
 
-    /// Number of leading transactions to convert sequentially before entering the rayon
-    /// parallel path.
-    ///
-    /// Rayon's work-stealing does not guarantee that index 0 is processed first, so the
-    /// ordered consumer can block for up to ~1ms waiting for the first slot. By converting
-    /// a small head sequentially and sending it immediately, execution can start without
-    /// waiting for rayon scheduling.
-    const PARALLEL_PREFETCH_COUNT: usize = 4;
-
-    /// Size of the first parallel tx batch in non-BAL path.
-    const FIRST_PARALLEL_TX_WINDOW_SIZE: usize = 64;
-
     /// Spawns a task advancing transaction env iterator and streaming updates through a channel.
     ///
     /// For blocks with fewer than [`Self::SMALL_BLOCK_TX_THRESHOLD`] transactions, uses
-    /// sequential iteration to avoid rayon overhead. For larger blocks, uses rayon parallel
-    /// iteration to convert transactions in parallel while streaming results to execution.
+    /// sequential iteration to avoid rayon overhead. For larger blocks, converts transactions in
+    /// parallel on the cpu pool while streaming results to execution.
     ///
-    /// When `parallel_bal_execution` is disabled, preserves the original transaction order.
-    /// Otherwise, streams results as they become available.
+    /// Streams results as they become available. When `parallel_bal_execution` is disabled,
+    /// workers claim transactions in block order, and [`PayloadHandle::iter_transactions`]
+    /// restores the order.
     #[instrument(level = "debug", target = "engine::tree::payload_processor", skip_all)]
     fn spawn_tx_iterator<I: ExecutableTxIterator<Evm>>(
         &self,
@@ -267,51 +257,26 @@ where
                             });
                     });
                 } else {
-                    // To avoid a ~1ms stall waiting for rayon to schedule index 0, the first
-                    // few transactions are recovered sequentially and sent immediately before
-                    // entering the parallel iterator for the remainder.
-                    let prefetch = Self::PARALLEL_PREFETCH_COUNT.min(transaction_count);
-                    let mut iter = transactions.into_iter();
-
-                    // Convert the first few transactions sequentially so execution can
-                    // start immediately without waiting for rayon work-stealing.
-                    convert_serial(iter.by_ref().take(prefetch), &convert, &prewarm_tx, &execute_tx);
-
-                    let mut iter = iter.enumerate();
-
-                    let mut batch_size = Self::FIRST_PARALLEL_TX_WINDOW_SIZE;
-
-                    // Without BALs, we need to preserve the initial order of transactions.
-                    // Process exponentially increasing windows to make sure that first transactions are prioritized.
-                    executor.cpu_pool().install(move || {
-                        loop {
-                            let chunk = iter
-                                .by_ref()
-                                .take(batch_size)
-                                .collect::<Vec<_>>();
-                            if chunk.is_empty() {
-                                break;
-                            }
-
-                            batch_size = batch_size.saturating_mul(2);
-
-                            let chunk = chunk
-                                .into_par_iter()
-                                .map(|(i, tx)| {
-                                    let idx = i + prefetch;
-                                    let tx = convert.convert(tx).map(WithTxEnv::new);
-                                    (idx, tx)
-                                })
-                                .collect::<Vec<_>>();
-
-                            for (idx, tx) in chunk {
+                    // Without BALs, execution needs transactions in block order. `par_bridge`
+                    // hands them out one at a time from the shared iterator, so idle workers
+                    // always take the lowest unconverted index.
+                    executor.cpu_pool().install(|| {
+                        let _ = transactions.into_iter().enumerate().par_bridge().try_for_each(
+                            |(idx, tx)| {
+                                let tx = convert.convert(tx).map(WithTxEnv::new);
+                                let failed = tx.is_err();
                                 if let Ok(tx) = &tx {
                                     let _ = prewarm_tx.send((idx, tx.clone()));
                                 }
-                                let _ = execute_tx.send((idx, tx));
-                                trace!(target: "engine::tree::payload_processor", idx, "yielded transaction");
-                            }
-                        }
+                                // Every earlier index is already claimed, so execution still
+                                // receives the transactions before a failed one.
+                                if execute_tx.send((idx, tx)).is_err() || failed {
+                                    Err(())
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                        );
                     });
                 }
             });
@@ -540,9 +505,26 @@ impl<Tx, Err, R: Send + Sync + 'static> PayloadHandle<Tx, Err, R> {
         self.prewarm_handle.terminate_caching(execution_outcome)
     }
 
-    /// Returns iterator yielding transactions from the stream.
+    /// Returns iterator yielding transactions from the stream in block order.
+    ///
+    /// Transactions converted ahead of an earlier one wait here until the gap closes.
     pub fn iter_transactions(&mut self) -> impl Iterator<Item = Result<Tx, Err>> + '_ {
-        self.transactions.iter().map(|(_, tx)| tx)
+        let mut early = BTreeMap::new();
+        let mut next = 0;
+        std::iter::from_fn(move || {
+            let tx = match early.remove(&next) {
+                Some(tx) => tx,
+                None => loop {
+                    let (idx, tx) = self.transactions.recv().ok()?;
+                    if idx == next {
+                        break tx
+                    }
+                    early.insert(idx, tx);
+                },
+            };
+            next += 1;
+            Some(tx)
+        })
     }
 
     /// Returns a clone of the indexed transaction receiver.
