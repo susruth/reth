@@ -259,8 +259,9 @@ where
     ///
     /// The prewarm channel is only created when `prewarm_transactions` is set, see
     /// [`Self::prewarms_transactions`]; otherwise no transaction is cloned into it.
+    #[doc(hidden)]
     #[instrument(level = "debug", target = "engine::tree::payload_processor", skip_all)]
-    fn spawn_tx_iterator<I: ExecutableTxIterator<Evm>>(
+    pub fn spawn_tx_iterator<I: ExecutableTxIterator<Evm>>(
         &self,
         transactions: I,
         transaction_count: usize,
