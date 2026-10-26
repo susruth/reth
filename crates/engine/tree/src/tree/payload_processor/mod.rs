@@ -29,7 +29,7 @@ pub use reth_trie_parallel::{
     },
 };
 use std::{
-    collections::BTreeMap,
+    collections::VecDeque,
     ops::Not,
     sync::{
         atomic::{AtomicBool, AtomicUsize},
@@ -290,9 +290,13 @@ where
                         }
                     };
                     executor.cpu_pool().in_place_scope(|scope| {
-                        for _ in 0..executor.cpu_pool().current_num_threads() {
-                            scope.spawn(|_| convert_claimed());
-                        }
+                        // A pool thread spawns the other workers, so this thread starts at once.
+                        scope.spawn(|scope| {
+                            for _ in 1..executor.cpu_pool().current_num_threads() {
+                                scope.spawn(|_| convert_claimed());
+                            }
+                            convert_claimed();
+                        });
                         convert_claimed();
                     });
                 }
@@ -584,21 +588,21 @@ impl<Tx, Err, R: Send + Sync + 'static> PayloadHandle<Tx, Err, R> {
     ///
     /// Transactions converted ahead of an earlier one wait here until the gap closes.
     pub fn iter_transactions(&mut self) -> impl Iterator<Item = Result<Tx, Err>> + '_ {
-        let mut early = BTreeMap::new();
+        // `pending[i]` holds the transaction at index `next + i` once it has arrived.
+        let mut pending = VecDeque::new();
         let mut next = 0;
         std::iter::from_fn(move || {
-            let tx = match early.remove(&next) {
-                Some(tx) => tx,
-                None => loop {
-                    let (idx, tx) = self.transactions.recv().ok()?;
-                    if idx == next {
-                        break tx
-                    }
-                    early.insert(idx, tx);
-                },
-            };
+            while !matches!(pending.front(), Some(Some(_))) {
+                let (idx, tx) = self.transactions.recv().ok()?;
+                // Indices below `next` were already yielded, and each index is sent once.
+                let offset = idx - next;
+                if offset >= pending.len() {
+                    pending.resize_with(offset + 1, || None);
+                }
+                pending[offset] = Some(tx);
+            }
             next += 1;
-            Some(tx)
+            pending.pop_front().flatten()
         })
     }
 
