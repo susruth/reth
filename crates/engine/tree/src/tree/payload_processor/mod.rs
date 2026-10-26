@@ -256,6 +256,14 @@ where
                                 trace!(target: "engine::tree::payload_processor", idx, "yielded transaction");
                             });
                     });
+                } else if metal_ab_legacy_order() {
+                    convert_chunked_legacy(
+                        executor.cpu_pool(),
+                        transactions,
+                        convert,
+                        &prewarm_tx,
+                        &execute_tx,
+                    );
                 } else {
                     // Without BALs, execution needs transactions in block order. `par_bridge`
                     // hands them out one at a time from the shared iterator, so idle workers
@@ -450,6 +458,64 @@ fn convert_serial<RawTx, Tx, TxEnv, InnerTx, Recovered, Err, C>(
         let _ = execute_tx.send((idx, tx));
         trace!(target: "engine::tree::payload_processor", idx, "yielded transaction");
     }
+}
+
+/// METAL A/B ONLY, never upstream: the pre-change chunked ordering, chosen per block when the
+/// file named by `METAL_PROBE_SENDERS_FILE` exists and does not contain "ordered".
+fn metal_ab_legacy_order() -> bool {
+    std::env::var("METAL_PROBE_SENDERS_FILE")
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .is_some_and(|mode| !mode.contains("ordered"))
+}
+
+/// METAL A/B ONLY: the pre-change body of the non-BAL path at 943af245c.
+fn convert_chunked_legacy<I, RawTx, Tx, TxEnv, InnerTx, Recovered, Err, C>(
+    pool: &rayon::ThreadPool,
+    transactions: I,
+    convert: C,
+    prewarm_tx: &mpsc::SyncSender<(usize, WithTxEnv<TxEnv, Recovered>)>,
+    execute_tx: &ExecuteTxSender<TxEnv, Recovered, Err>,
+) where
+    I: IntoIterator<Item = RawTx, IntoIter: Send> + Send + 'static,
+    RawTx: Send,
+    Tx: ExecutableTxParts<TxEnv, InnerTx, Recovered = Recovered>,
+    TxEnv: Clone + Send + 'static,
+    Recovered: Send + Sync + 'static,
+    Err: Send + 'static,
+    C: ConvertTx<RawTx, Tx = Tx, Error = Err>,
+{
+    const PARALLEL_PREFETCH_COUNT: usize = 4;
+    const FIRST_PARALLEL_TX_WINDOW_SIZE: usize = 64;
+    let mut iter = transactions.into_iter();
+    let mut prefetch = 0;
+    for raw in iter.by_ref().take(PARALLEL_PREFETCH_COUNT) {
+        let tx = convert.convert(raw).map(WithTxEnv::new);
+        if let Ok(tx) = &tx {
+            let _ = prewarm_tx.send((prefetch, tx.clone()));
+        }
+        let _ = execute_tx.send((prefetch, tx));
+        prefetch += 1;
+    }
+    let mut iter = iter.enumerate();
+    let mut batch_size = FIRST_PARALLEL_TX_WINDOW_SIZE;
+    pool.install(move || loop {
+        let chunk = iter.by_ref().take(batch_size).collect::<Vec<_>>();
+        if chunk.is_empty() {
+            break;
+        }
+        batch_size = batch_size.saturating_mul(2);
+        let chunk = chunk
+            .into_par_iter()
+            .map(|(i, tx)| (i + prefetch, convert.convert(tx).map(WithTxEnv::new)))
+            .collect::<Vec<_>>();
+        for (idx, tx) in chunk {
+            if let Ok(tx) = &tx {
+                let _ = prewarm_tx.send((idx, tx.clone()));
+            }
+            let _ = execute_tx.send((idx, tx));
+        }
+    });
 }
 
 /// Handle to all the spawned tasks.
