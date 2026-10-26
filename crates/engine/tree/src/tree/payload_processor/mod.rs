@@ -265,26 +265,35 @@ where
                         &execute_tx,
                     );
                 } else {
-                    // Without BALs, execution needs transactions in block order. `par_bridge`
-                    // hands them out one at a time from the shared iterator, so idle workers
-                    // always take the lowest unconverted index.
-                    executor.cpu_pool().install(|| {
-                        let _ = transactions.into_iter().enumerate().par_bridge().try_for_each(
-                            |(idx, tx)| {
-                                let tx = convert.convert(tx).map(WithTxEnv::new);
-                                let failed = tx.is_err();
-                                if let Ok(tx) = &tx {
-                                    let _ = prewarm_tx.send((idx, tx.clone()));
-                                }
-                                // Every earlier index is already claimed, so execution still
-                                // receives the transactions before a failed one.
-                                if execute_tx.send((idx, tx)).is_err() || failed {
-                                    Err(())
-                                } else {
-                                    Ok(())
-                                }
-                            },
-                        );
+                    // Without BALs, execution needs transactions in block order. Every worker
+                    // claims the next transaction from one shared iterator, so the lowest
+                    // unconverted index is always taken first. This thread claims too, so the
+                    // first transaction does not wait for a pool thread to wake. After a failure,
+                    // every earlier index is already claimed, so execution still receives the
+                    // transactions before it.
+                    let transactions =
+                        std::sync::Mutex::new(transactions.into_iter().enumerate());
+                    let stop = AtomicBool::new(false);
+                    let convert_claimed = || {
+                        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            let Some((idx, tx)) = transactions.lock().unwrap().next() else {
+                                break
+                            };
+                            let tx = convert.convert(tx).map(WithTxEnv::new);
+                            let failed = tx.is_err();
+                            if let Ok(tx) = &tx {
+                                let _ = prewarm_tx.send((idx, tx.clone()));
+                            }
+                            if execute_tx.send((idx, tx)).is_err() || failed {
+                                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    };
+                    executor.cpu_pool().in_place_scope(|scope| {
+                        for _ in 0..executor.cpu_pool().current_num_threads() {
+                            scope.spawn(|_| convert_claimed());
+                        }
+                        convert_claimed();
                     });
                 }
             });
