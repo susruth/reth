@@ -289,14 +289,19 @@ where
                             }
                         }
                     };
+                    // With this thread, conversion uses as many threads as the pool has.
+                    let workers = executor.cpu_pool().current_num_threads().saturating_sub(1);
                     executor.cpu_pool().in_place_scope(|scope| {
-                        // A pool thread spawns the other workers, so this thread starts at once.
-                        scope.spawn(|scope| {
-                            for _ in 1..executor.cpu_pool().current_num_threads() {
-                                scope.spawn(|_| convert_claimed());
-                            }
-                            convert_claimed();
-                        });
+                        if workers > 0 {
+                            // A pool thread spawns the other workers, so this thread starts at
+                            // once.
+                            scope.spawn(|scope| {
+                                for _ in 1..workers {
+                                    scope.spawn(|_| convert_claimed());
+                                }
+                                convert_claimed();
+                            });
+                        }
                         convert_claimed();
                     });
                 }
