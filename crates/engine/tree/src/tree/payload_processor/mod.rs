@@ -289,8 +289,22 @@ where
                             }
                         }
                     };
-                    // With this thread, conversion uses as many threads as the pool has.
-                    let workers = executor.cpu_pool().current_num_threads().saturating_sub(1);
+                    // Release the first transaction before waking the pool, so execution starts
+                    // without competing with workers that are spinning up.
+                    let first = transactions.lock().unwrap().next();
+                    if let Some((idx, tx)) = first {
+                        let tx = convert.convert(tx).map(WithTxEnv::new);
+                        let failed = tx.is_err();
+                        if let Ok(tx) = &tx {
+                            let _ = prewarm_tx.send((idx, tx.clone()));
+                        }
+                        if execute_tx.send((idx, tx)).is_err() || failed {
+                            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    // With this thread, conversion uses one thread fewer than the pool has, so
+                    // execution keeps a core while every other thread converts.
+                    let workers = executor.cpu_pool().current_num_threads().saturating_sub(2);
                     executor.cpu_pool().in_place_scope(|scope| {
                         if workers > 0 {
                             // A pool thread spawns the other workers, so this thread starts at
